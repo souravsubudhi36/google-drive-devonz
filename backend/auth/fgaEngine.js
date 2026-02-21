@@ -1,175 +1,157 @@
 /**
  * OpenFGA Authorization Engine
- * Implements the authorization model from the DSL:
- *
- * - organization: admin, member (admin is also member)
- * - folder: owner, editor (includes owner), viewer (includes editor)
- *   - inherits from parent_folder
- * - document: owner, editor, viewer + can_edit, can_view, can_delete
- *   - inherits from parent_folder
+ * 
+ * This module wraps the official @openfga/sdk client and provides
+ * high-level authorization methods used by the middleware and controllers.
+ * 
+ * ALL authorization checks go through the real OpenFGA server via the SDK.
+ * No local/in-memory authorization logic — the OpenFGA server resolves
+ * the full relation graph including inheritance, parent_folder traversal,
+ * and computed relations (can_view, can_edit, can_delete).
  */
 
+import { getClient } from './openfgaClient.js';
 import store from '../store/dataStore.js';
 
 class FGAEngine {
   /**
    * Check if a user has a specific relation to an object.
-   * Implements the full resolution logic including inheritance.
+   * Delegates to the OpenFGA server via the SDK's check() method.
+   * 
+   * @param {string} userId - e.g., "user:alice"
+   * @param {string} relation - e.g., "can_view", "editor", "owner"
+   * @param {string} objectId - e.g., "document:arch-overview", "folder:root-engineering"
+   * @returns {Promise<boolean>}
    */
-  check(userId, relation, objectId, visited = new Set()) {
-    const key = `${userId}|${relation}|${objectId}`;
-    if (visited.has(key)) return false;
-    visited.add(key);
-
-    const objectType = objectId.split(':')[0];
-
-    switch (objectType) {
-      case 'organization':
-        return this._checkOrganization(userId, relation, objectId, visited);
-      case 'folder':
-        return this._checkFolder(userId, relation, objectId, visited);
-      case 'document':
-        return this._checkDocument(userId, relation, objectId, visited);
-      default:
-        return false;
+  async check(userId, relation, objectId) {
+    try {
+      const client = getClient();
+      const response = await client.check({
+        user: userId,
+        relation,
+        object: objectId,
+      });
+      return response.allowed === true;
+    } catch (err) {
+      console.error(`[FGA Check Error] user=${userId} relation=${relation} object=${objectId}:`, err.message);
+      return false;
     }
   }
 
-  _checkOrganization(userId, relation, orgId, visited) {
-    // Direct tuple check
-    if (this._hasTuple(userId, relation, orgId)) return true;
+  /**
+   * Write relationship tuples to the OpenFGA server.
+   * 
+   * @param {Array<{user: string, relation: string, object: string}>} tuples
+   */
+  async writeTuples(tuples) {
+    const client = getClient();
+    const writes = tuples.map(t => ({
+      user: t.user,
+      relation: t.relation,
+      object: t.object,
+    }));
 
-    // member includes admin
-    if (relation === 'member') {
-      if (this._hasTuple(userId, 'admin', orgId)) return true;
-    }
-
-    return false;
+    await client.write({
+      writes,
+    }, {
+      authorizationModelId: undefined, // uses the one set on the client
+    });
   }
 
-  _checkFolder(userId, relation, folderId, visited) {
-    // Direct tuple check
-    if (this._hasTuple(userId, relation, folderId)) return true;
+  /**
+   * Delete relationship tuples from the OpenFGA server.
+   * 
+   * @param {Array<{user: string, relation: string, object: string}>} tuples
+   */
+  async deleteTuples(tuples) {
+    const client = getClient();
+    const deletes = tuples.map(t => ({
+      user: t.user,
+      relation: t.relation,
+      object: t.object,
+    }));
 
-    // Check org#member tuples (e.g., organization:acme#member as editor/viewer)
-    if (relation === 'editor' || relation === 'viewer') {
-      const orgMemberTuples = store.getTuples({ relation, object: folderId });
-      for (const tuple of orgMemberTuples) {
-        if (tuple.user.includes('#member')) {
-          const orgId = tuple.user.split('#')[0].replace('organization:', 'org:');
-          if (this.check(userId, 'member', orgId.replace('org:', 'organization:'), visited)) {
-            return true;
-          }
-        }
-      }
-    }
-
-    // Relation hierarchy: viewer includes editor, editor includes owner
-    if (relation === 'editor') {
-      if (this._checkFolder(userId, 'owner', folderId, visited)) return true;
-    }
-    if (relation === 'viewer') {
-      if (this._checkFolder(userId, 'editor', folderId, visited)) return true;
-    }
-
-    // Inherit from parent_folder
-    const parentTuples = store.getTuples({ relation: 'parent_folder', object: folderId });
-    for (const pt of parentTuples) {
-      const parentFolderId = pt.user;
-      if (parentFolderId.startsWith('folder:')) {
-        if (this.check(userId, relation, parentFolderId, visited)) return true;
-
-        // Also check hierarchy through parent
-        if (relation === 'editor' && this.check(userId, 'owner', parentFolderId, visited)) return true;
-        if (relation === 'viewer' && this.check(userId, 'editor', parentFolderId, visited)) return true;
-      }
-    }
-
-    return false;
-  }
-
-  _checkDocument(userId, relation, docId, visited) {
-    // Resolve action-based relations
-    if (relation === 'can_edit') return this._checkDocument(userId, 'editor', docId, visited);
-    if (relation === 'can_view') return this._checkDocument(userId, 'viewer', docId, visited);
-    if (relation === 'can_delete') return this._checkDocument(userId, 'owner', docId, visited);
-
-    // Direct tuple check
-    if (this._hasTuple(userId, relation, docId)) return true;
-
-    // Relation hierarchy
-    if (relation === 'editor') {
-      if (this._checkDocument(userId, 'owner', docId, visited)) return true;
-    }
-    if (relation === 'viewer') {
-      if (this._checkDocument(userId, 'editor', docId, visited)) return true;
-    }
-
-    // Inherit from parent_folder
-    const parentTuples = store.getTuples({ relation: 'parent_folder', object: docId });
-    for (const pt of parentTuples) {
-      const parentFolderId = pt.user;
-      if (parentFolderId.startsWith('folder:')) {
-        if (this.check(userId, relation, parentFolderId, visited)) return true;
-      }
-    }
-
-    return false;
-  }
-
-  _hasTuple(user, relation, object) {
-    return store.getTuples({ user, relation, object }).length > 0;
+    await client.write({
+      deletes,
+    });
   }
 
   /**
    * List all objects of a given type that a user has a specific relation to.
+   * Uses the OpenFGA ListObjects API.
+   * 
+   * @param {string} userId - e.g., "user:alice"
+   * @param {string} relation - e.g., "viewer"
+   * @param {string} objectType - e.g., "folder", "document"
+   * @returns {Promise<string[]>} - Array of object IDs
    */
-  listObjects(userId, relation, objectType) {
-    const results = [];
-    let objects;
-
-    if (objectType === 'folder') {
-      objects = store.folders;
-    } else if (objectType === 'document') {
-      objects = store.documents;
-    } else if (objectType === 'organization') {
-      objects = store.organizations;
-    } else {
-      return results;
+  async listObjects(userId, relation, objectType) {
+    try {
+      const client = getClient();
+      const response = await client.listObjects({
+        user: userId,
+        relation,
+        type: objectType,
+      });
+      return response.objects || [];
+    } catch (err) {
+      console.error(`[FGA ListObjects Error] user=${userId} relation=${relation} type=${objectType}:`, err.message);
+      return [];
     }
-
-    for (const [id] of objects) {
-      const fgaId = objectType === 'organization' ? id.replace('org:', 'organization:') : id;
-      if (this.check(userId, relation, fgaId)) {
-        results.push(id);
-      }
-    }
-
-    return results;
   }
 
   /**
    * Get the effective permission level for a user on an object.
+   * Checks owner → editor → viewer in order.
+   * 
+   * @param {string} userId
+   * @param {string} objectId
+   * @returns {Promise<string>} - 'owner' | 'editor' | 'viewer' | 'none'
    */
-  getPermissionLevel(userId, objectId) {
-    if (this.check(userId, 'owner', objectId)) return 'owner';
-    if (this.check(userId, 'editor', objectId)) return 'editor';
-    if (this.check(userId, 'viewer', objectId)) return 'viewer';
+  async getPermissionLevel(userId, objectId) {
+    if (await this.check(userId, 'owner', objectId)) return 'owner';
+    if (await this.check(userId, 'editor', objectId)) return 'editor';
+    if (await this.check(userId, 'viewer', objectId)) return 'viewer';
     return 'none';
   }
 
   /**
    * Get all users who have access to an object with their roles.
+   * Checks each known user against the object.
+   * 
+   * @param {string} objectId
+   * @returns {Promise<Array>}
    */
-  getObjectSharing(objectId) {
+  async getObjectSharing(objectId) {
     const sharing = [];
     for (const [userId, user] of store.users) {
-      const level = this.getPermissionLevel(userId, objectId);
+      const level = await this.getPermissionLevel(userId, objectId);
       if (level !== 'none') {
         sharing.push({ ...user, permission: level });
       }
     }
     return sharing;
+  }
+
+  /**
+   * Read tuples from the OpenFGA server (for debugging/display).
+   * 
+   * @param {Object} filter - { user?, relation?, object? }
+   * @returns {Promise<Array>}
+   */
+  async readTuples(filter = {}) {
+    try {
+      const client = getClient();
+      const response = await client.read({
+        user: filter.user || undefined,
+        relation: filter.relation || undefined,
+        object: filter.object || undefined,
+      });
+      return response.tuples || [];
+    } catch (err) {
+      console.error('[FGA ReadTuples Error]:', err.message);
+      return [];
+    }
   }
 }
 

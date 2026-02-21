@@ -1,13 +1,13 @@
 import store from '../store/dataStore.js';
 import fgaEngine from '../auth/fgaEngine.js';
 
-export function getSharing(req, res) {
+export async function getSharing(req, res) {
   const { objectId } = req.params;
-  const sharing = fgaEngine.getObjectSharing(objectId);
+  const sharing = await fgaEngine.getObjectSharing(objectId);
   res.json({ sharing });
 }
 
-export function addSharing(req, res) {
+export async function addSharing(req, res) {
   const { objectId } = req.params;
   const { userId, relation } = req.body;
 
@@ -23,25 +23,52 @@ export function addSharing(req, res) {
     return res.status(404).json({ error: 'User not found' });
   }
 
-  // Remove existing direct tuples for this user on this object
-  store.removeTuple(userId, 'owner', objectId);
-  store.removeTuple(userId, 'editor', objectId);
-  store.removeTuple(userId, 'viewer', objectId);
+  // Remove existing direct tuples for this user on this object via OpenFGA SDK
+  const tuplesToDelete = [];
+  for (const rel of ['owner', 'editor', 'viewer']) {
+    try {
+      const hasRelation = await fgaEngine.check(userId, rel, objectId);
+      if (hasRelation) {
+        tuplesToDelete.push({ user: userId, relation: rel, object: objectId });
+      }
+    } catch {
+      // Ignore check errors during cleanup
+    }
+  }
 
-  // Add new tuple
-  store.addTuple(userId, relation, objectId);
+  // Try to delete old tuples (may fail if they don't exist as direct tuples)
+  for (const tuple of tuplesToDelete) {
+    try {
+      await fgaEngine.deleteTuples([tuple]);
+    } catch {
+      // Tuple may not exist as a direct relationship (could be inherited)
+    }
+  }
 
-  const sharing = fgaEngine.getObjectSharing(objectId);
+  // Write new tuple to OpenFGA server
+  try {
+    await fgaEngine.writeTuples([{ user: userId, relation, object: objectId }]);
+  } catch (err) {
+    console.error('[Add Sharing] Failed to write tuple:', err.message);
+    return res.status(500).json({ error: 'Failed to update sharing' });
+  }
+
+  const sharing = await fgaEngine.getObjectSharing(objectId);
   res.json({ sharing });
 }
 
-export function removeSharing(req, res) {
+export async function removeSharing(req, res) {
   const { objectId, userId } = req.params;
 
-  store.removeTuple(userId, 'owner', objectId);
-  store.removeTuple(userId, 'editor', objectId);
-  store.removeTuple(userId, 'viewer', objectId);
+  // Remove all direct tuples for this user on this object
+  for (const rel of ['owner', 'editor', 'viewer']) {
+    try {
+      await fgaEngine.deleteTuples([{ user: userId, relation: rel, object: objectId }]);
+    } catch {
+      // Tuple may not exist
+    }
+  }
 
-  const sharing = fgaEngine.getObjectSharing(objectId);
+  const sharing = await fgaEngine.getObjectSharing(objectId);
   res.json({ sharing });
 }

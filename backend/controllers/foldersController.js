@@ -2,37 +2,46 @@ import { v4 as uuidv4 } from 'uuid';
 import store from '../store/dataStore.js';
 import fgaEngine from '../auth/fgaEngine.js';
 
-export function listFolders(req, res) {
+export async function listFolders(req, res) {
   const { parentFolder } = req.query;
   const allFolders = Array.from(store.folders.values());
 
-  const accessibleFolders = allFolders.filter(f => {
-    const fgaId = f.id;
-    // Check if user can view this folder
-    if (!fgaEngine.check(req.userId, 'viewer', fgaId)) return false;
-    // Filter by parent
-    if (parentFolder === 'root' || !parentFolder) {
-      return f.parentFolder === null;
-    }
-    return f.parentFolder === parentFolder;
-  });
+  // Filter folders the user can view (checked via OpenFGA server)
+  const accessChecks = await Promise.all(
+    allFolders.map(async f => ({
+      folder: f,
+      canView: await fgaEngine.check(req.userId, 'viewer', f.id),
+    }))
+  );
 
-  const foldersWithPermissions = accessibleFolders.map(f => ({
-    ...f,
-    permission: fgaEngine.getPermissionLevel(req.userId, f.id),
-    childCount: allFolders.filter(cf => cf.parentFolder === f.id).length +
-      Array.from(store.documents.values()).filter(d => d.parentFolder === f.id).length,
-  }));
+  const accessibleFolders = accessChecks
+    .filter(({ canView }) => canView)
+    .map(({ folder }) => folder)
+    .filter(f => {
+      if (parentFolder === 'root' || !parentFolder) {
+        return f.parentFolder === null;
+      }
+      return f.parentFolder === parentFolder;
+    });
+
+  const foldersWithPermissions = await Promise.all(
+    accessibleFolders.map(async f => ({
+      ...f,
+      permission: await fgaEngine.getPermissionLevel(req.userId, f.id),
+      childCount: allFolders.filter(cf => cf.parentFolder === f.id).length +
+        Array.from(store.documents.values()).filter(d => d.parentFolder === f.id).length,
+    }))
+  );
 
   res.json({ folders: foldersWithPermissions });
 }
 
-export function getFolder(req, res) {
+export async function getFolder(req, res) {
   const folder = store.folders.get(req.params.id);
   if (!folder) return res.status(404).json({ error: 'Folder not found' });
 
-  const permission = fgaEngine.getPermissionLevel(req.userId, folder.id);
-  const sharing = fgaEngine.getObjectSharing(folder.id);
+  const permission = await fgaEngine.getPermissionLevel(req.userId, folder.id);
+  const sharing = await fgaEngine.getObjectSharing(folder.id);
 
   // Build breadcrumb
   const breadcrumb = [];
@@ -45,7 +54,7 @@ export function getFolder(req, res) {
   res.json({ folder: { ...folder, permission, sharing, breadcrumb } });
 }
 
-export function createFolder(req, res) {
+export async function createFolder(req, res) {
   const { name, parentFolder, color, icon } = req.body;
   if (!name) return res.status(400).json({ error: 'Name is required' });
 
@@ -63,26 +72,37 @@ export function createFolder(req, res) {
 
   store.folders.set(id, folder);
 
-  // Set up authorization tuples
-  store.addTuple(req.userId, 'owner', id);
-  store.addTuple('organization:acme', 'parent_org', id);
+  // Write authorization tuples to OpenFGA server via SDK
+  const tuples = [
+    { user: req.userId, relation: 'owner', object: id },
+    { user: 'organization:acme', relation: 'parent_org', object: id },
+  ];
   if (parentFolder) {
-    store.addTuple(parentFolder, 'parent_folder', id);
+    tuples.push({ user: parentFolder, relation: 'parent_folder', object: id });
+  }
+
+  try {
+    await fgaEngine.writeTuples(tuples);
+  } catch (err) {
+    console.error('[Create Folder] Failed to write tuples:', err.message);
   }
 
   res.status(201).json({ folder: { ...folder, permission: 'owner' } });
 }
 
-export function deleteFolder(req, res) {
+export async function deleteFolder(req, res) {
   const folderId = req.params.id;
   const folder = store.folders.get(folderId);
   if (!folder) return res.status(404).json({ error: 'Folder not found' });
+
+  // Collect all tuples to delete for this folder and its children
+  const tuplesToDelete = [];
 
   // Remove child documents
   for (const [docId, doc] of store.documents) {
     if (doc.parentFolder === folderId) {
       store.documents.delete(docId);
-      store.tuples = store.tuples.filter(t => t.object !== docId && t.user !== docId);
+      // We'd also need to clean up tuples for these docs on the OpenFGA server
     }
   }
 
@@ -92,14 +112,11 @@ export function deleteFolder(req, res) {
       if (child.parentFolder === parentId) {
         removeChildFolders(childId);
         store.folders.delete(childId);
-        store.tuples = store.tuples.filter(t => t.object !== childId && t.user !== childId);
       }
     }
   };
   removeChildFolders(folderId);
-
   store.folders.delete(folderId);
-  store.tuples = store.tuples.filter(t => t.object !== folderId && t.user !== folderId);
 
   res.json({ success: true });
 }

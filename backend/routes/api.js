@@ -4,6 +4,7 @@ import { listUsers, getCurrentUser } from '../controllers/usersController.js';
 import { listFolders, getFolder, createFolder, deleteFolder } from '../controllers/foldersController.js';
 import { listDocuments, getDocument, createDocument, updateDocument, deleteDocument } from '../controllers/documentsController.js';
 import { getSharing, addSharing, removeSharing } from '../controllers/sharingController.js';
+import { checkPermission, listObjectsForUser, getConnectionInfo } from '../controllers/fgaController.js';
 
 const router = Router();
 
@@ -55,5 +56,10 @@ router.delete('/sharing/:objectId/:userId',
   authorize('owner', req => req.params.objectId),
   removeSharing
 );
+
+// FGA Debug/Tester endpoints
+router.post('/fga/check', checkPermission);
+router.get('/fga/list-objects', listObjectsForUser);
+router.get('/fga/connection', getConnectionInfo);
 
 export default router;
